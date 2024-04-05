@@ -14,3 +14,4 @@
 *.pyc
 cache
 dist
+/temp
