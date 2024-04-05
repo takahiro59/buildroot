@@ -1,0 +1,180 @@
+diff --git a/drivers/net/usb/Kconfig b/drivers/net/usb/Kconfig
+index 3fd7dccf0f9..56848b13476 100644
+--- a/drivers/net/usb/Kconfig
++++ b/drivers/net/usb/Kconfig
+@@ -588,6 +588,14 @@ config USB_IPHETH
+ 	  to pair your device with your system, for example usbmuxd
+ 	  <https://github.com/libimobiledevice/usbmuxd>.
+ 
++config USB_IDEVICE_DEBUG_NCM
++	tristate "Apple iDevice Debug NCM Ethernet Driver"
++	default n
++	help
++	  Module used to bring up the CDC NCM interfaces that appear in
++	  configurations 5 and 6. If you're using usbmuxd and iOs >= 17.0,
++	  say y.
++
+ config USB_SIERRA_NET
+ 	tristate "USB-to-WWAN Driver for Sierra Wireless modems"
+ 	depends on USB_USBNET
+diff --git a/drivers/net/usb/Makefile b/drivers/net/usb/Makefile
+index 4964f7b326f..617ca5b9afb 100644
+--- a/drivers/net/usb/Makefile
++++ b/drivers/net/usb/Makefile
+@@ -32,6 +32,7 @@ obj-$(CONFIG_USB_NET_INT51X1)	+= int51x1.o
+ obj-$(CONFIG_USB_CDC_PHONET)	+= cdc-phonet.o
+ obj-$(CONFIG_USB_NET_KALMIA)	+= kalmia.o
+ obj-$(CONFIG_USB_IPHETH)	+= ipheth.o
++obj-$(CONFIG_USB_IDEVICE_DEBUG_NCM)	+= idevice_debug_ncm.o
+ obj-$(CONFIG_USB_SIERRA_NET)	+= sierra_net.o
+ obj-$(CONFIG_USB_NET_CX82310_ETH)	+= cx82310_eth.o
+ obj-$(CONFIG_USB_NET_CDC_NCM)	+= cdc_ncm.o
+diff --git a/drivers/net/usb/cdc_ncm.c b/drivers/net/usb/cdc_ncm.c
+index db05622f1f7..47a85eb370f 100644
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@ -933,7 +933,7 @@ int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_
+ 
+ 	cdc_ncm_find_endpoints(dev, ctx->data);
+ 	cdc_ncm_find_endpoints(dev, ctx->control);
+-	if (!dev->in || !dev->out || !dev->status) {
++	if (!dev->in || !dev->out || ( !dev->status && !(ctx->drvflags & CDC_NCM_FLAG_NO_NOTIFICATION_ENDPOINT)) ) {
+ 		dev_dbg(&intf->dev, "failed to collect endpoints\n");
+ 		goto error2;
+ 	}
+diff --git a/drivers/net/usb/idevice_debug_ncm.c b/drivers/net/usb/idevice_debug_ncm.c
+new file mode 100644
+index 00000000000..95782b48ca4
+--- /dev/null
++++ b/drivers/net/usb/idevice_debug_ncm.c
+@@ -0,0 +1,118 @@
++// SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0-only)
++/*
++ * idevice_debug_ncm.c - Apple Ios debug CDC-NCM Ethernet driver
++ *
++ * For iOS 17, the developer/debug interfaces moved from the usbmuxd socket
++ * to a remoteXPC service on a QUIC tunnel on a USB CDC-NCM interface
++ * that the device presents in USB configurations 5 and 6. Neither configuration
++ * is present until some vendor specific URB is sent by the host.
++ * The device offers two CDC-NCM interfaces. The second is the debug interface.
++ * However, it lacks a notification endpoint on its control interface, which
++ * the cdc_ncm driver doesn't like, hence the standalone module. It otherwise
++ * appears to be fairly normal CDC-NCM.
++ *
++ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program. If not, see <http://www.gnu.org/licenses/gpl-2.0.html>.
++ *
++ */
++
++#define USB_VENDOR_APPLE        0x05ac
++
++#include <linux/module.h>
++#include <linux/usb/usbnet.h>
++#include <linux/usb/cdc.h>
++#include <linux/usb/cdc_ncm.h>
++#include <linux/etherdevice.h>
++
++int idevice_debug_ncm_open(struct net_device *net)
++{
++	struct usbnet *dev = netdev_priv(net);
++	int retval;
++	/* usbnet_open() does almost everything we need... */
++	retval = usbnet_open(net);
++	/* We don't have a notification endpoint for some reason.
++	 * We'll never get a link change notification, so lets
++	 * just bring ourselves up...
++	 * something something bootstraps
++	 */
++	usbnet_link_change(dev, 1, 0);
++	return retval;
++}
++
++static const struct net_device_ops idevice_debug_ncm_netdev_ops = {
++	.ndo_open	     = idevice_debug_ncm_open,
++	.ndo_stop	     = usbnet_stop,
++	.ndo_start_xmit	     = usbnet_start_xmit,
++	.ndo_tx_timeout	     = usbnet_tx_timeout,
++	.ndo_set_rx_mode     = usbnet_set_rx_mode,
++	.ndo_get_stats64     = dev_get_tstats64,
++	.ndo_change_mtu	     = cdc_ncm_change_mtu,
++	.ndo_set_mac_address = eth_mac_addr,
++	.ndo_validate_addr   = eth_validate_addr,
++};
++
++static int idevice_debug_ncm_bind(struct usbnet *dev, struct usb_interface *intf)
++{
++	int retval;
++
++	if (cdc_ncm_select_altsetting(intf) != CDC_NCM_COMM_ALTSETTING_NCM)
++		return -ENODEV;
++	retval = cdc_ncm_bind_common(dev, intf, CDC_NCM_DATA_ALTSETTING_NCM,
++				     CDC_NCM_FLAG_NO_NOTIFICATION_ENDPOINT);
++	dev->net->netdev_ops = &idevice_debug_ncm_netdev_ops;
++	return retval;
++}
++
++static const struct driver_info cdc_ncm_info = {
++	.description = "iDevice Debug NCM",
++	.flags = FLAG_POINTTOPOINT | FLAG_NO_SETINT | FLAG_MULTI_PACKET
++		 | FLAG_LINK_INTR | FLAG_ETHER,
++	.bind = idevice_debug_ncm_bind,
++	.unbind = cdc_ncm_unbind,
++	.manage_power = usbnet_manage_power,
++	.rx_fixup = cdc_ncm_rx_fixup,
++	.tx_fixup = cdc_ncm_tx_fixup,
++	.set_rx_mode = usbnet_cdc_update_filter,
++};
++
++static const struct usb_device_id idevice_debug_ncm_devs[] = {
++	/* match Apple vendor ID and CDC_NCM interface descriptors */
++	{ USB_VENDOR_AND_INTERFACE_INFO(USB_VENDOR_APPLE, USB_CLASS_COMM,
++					      USB_CDC_SUBCLASS_NCM, USB_CDC_PROTO_NONE),
++		.driver_info = (unsigned long)&cdc_ncm_info,
++	},
++	{
++	},
++};
++
++static struct usb_driver idevice_debug_ncm_driver = {
++	.name = "idevice_debug_ncm",
++	.id_table = idevice_debug_ncm_devs,
++	.probe = usbnet_probe,
++	.disconnect = usbnet_disconnect,
++	.suspend = usbnet_suspend,
++	.resume = usbnet_resume,
++	.reset_resume =	usbnet_resume,
++	.supports_autosuspend = 1,
++	.disable_hub_initiated_lpm = 1,
++};
++
++MODULE_DEVICE_TABLE(usb, idevice_debug_ncm_devs);
++
++module_usb_driver(idevice_debug_ncm_driver);
++
++MODULE_AUTHOR("Morgan MacKechnie");
++MODULE_DESCRIPTION("CDC NCM Driver for idevice debug interface");
++MODULE_LICENSE("Dual BSD/GPL");
+diff --git a/include/linux/usb/cdc_ncm.h b/include/linux/usb/cdc_ncm.h
+index 2d207cb4837..38f4d1021bc 100644
+--- a/include/linux/usb/cdc_ncm.h
++++ b/include/linux/usb/cdc_ncm.h
+@@ -88,6 +88,7 @@
+ #define CDC_NCM_FLAG_NDP_TO_END			0x02	/* NDP is placed at end of frame */
+ #define CDC_MBIM_FLAG_AVOID_ALTSETTING_TOGGLE	0x04	/* Avoid altsetting toggle during init */
+ #define CDC_NCM_FLAG_PREFER_NTB32 0x08	/* prefer NDP32 over NDP16 */
++#define CDC_NCM_FLAG_NO_NOTIFICATION_ENDPOINT   0x10 /* Interface lacks a notification endpoint */
+ 
+ #define cdc_ncm_comm_intf_is_mbim(x)  ((x)->desc.bInterfaceSubClass == USB_CDC_SUBCLASS_MBIM && \
+ 				       (x)->desc.bInterfaceProtocol == USB_CDC_PROTO_NONE)
